@@ -27,7 +27,10 @@ Open **PhotoFrame** from the app menu. The first time, the settings window opens
 Photo folder · include subfolders · shuffle · seconds per photo · show whole photo or fill screen ·
 blurred or black background · fade · clock/date · file name · keep screen on · start at login.
 
-Saved to `~/.config/photoframe/config.json`. New photos added to the folder are picked up every 10 minutes.
+Changes show on the slideshow behind the settings window straight away and are saved
+automatically to `~/.config/photoframe/config.json`. The folder box checks your folder as you
+type; a folder without photos never replaces the one that's playing. New photos added to the
+folder are picked up every 10 minutes.
 
 ## Keeping the laptop on
 

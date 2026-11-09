@@ -36,6 +36,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import warnings
 
@@ -519,20 +520,174 @@ class KeepAwake:
 try:
     import tkinter as tk
     from tkinter import filedialog, ttk
+    from tkinter import font as tkfont
     from PIL import ImageTk
 except ImportError:
     tk = None
 
 
 if tk is not None:
+    # ---- look & feel of the settings window (dark, to match the slideshow)
+    T = dict(bg="#15171c", card="#1e2128", line="#2c303a", text="#e8eaed",
+             muted="#9aa0a6", accent="#4f8cff", accent_hi="#6d9fff", input="#111318",
+             off="#3a3f4b", off_hi="#4a505d", ok="#5bd08a", error="#ff7b72")
+    INTERVALS = [3, 5, 8, 10, 15, 20, 30, 45, 60, 90, 120, 300, 600, 1800, 3600]
+
+    def fmt_interval(sec):
+        if sec < 60:
+            return f"{sec} sec"
+        m, s = divmod(sec, 60)
+        return f"{m} min" if not s else f"{m} min {s} s"
+
+    def ui_font_family():
+        have = set(tkfont.families())
+        for fam in ("Ubuntu Sans", "Ubuntu", "Cantarell", "Noto Sans", "DejaVu Sans"):
+            if fam in have:
+                return fam
+        return "Sans"
+
+    def ui_scale(family):
+        """Pixel scale factor, so padding and switches grow with HiDPI fonts."""
+        ls = tkfont.Font(family=family, size=10).metrics("linespace")
+        return max(1.0, min(4.0, ls / 17))
+
+    def flat_button(parent, text, command, s, font, primary=False):
+        bg, hi = (T["accent"], T["accent_hi"]) if primary else (T["off"], T["off_hi"])
+        b = tk.Button(parent, text=text, command=command, font=font, fg="white", bg=bg,
+                      activebackground=hi, activeforeground="white", disabledforeground=T["muted"],
+                      relief="flat", bd=0, highlightthickness=0, cursor="hand2",
+                      padx=int(16 * s), pady=int(6 * s))
+        b.bind("<Enter>", lambda e: b.cget("state") != "disabled" and b.config(bg=hi))
+        b.bind("<Leave>", lambda e: b.config(bg=bg))
+        return b
+
+    class Toggle(tk.Canvas):
+        """An on/off switch."""
+
+        def __init__(self, parent, var, s, command=None):
+            self.w, self.h = int(42 * s), int(24 * s)
+            super().__init__(parent, width=self.w, height=self.h, bg=T["card"], bd=0,
+                             highlightthickness=0, cursor="hand2", takefocus=1)
+            self.var, self.s, self.command = var, s, command
+            for ev in ("<Button-1>", "<space>", "<Return>"):
+                self.bind(ev, self.toggle)
+            self.bind("<FocusIn>", lambda e: self.draw())
+            self.bind("<FocusOut>", lambda e: self.draw())
+            var.trace_add("write", lambda *a: self.draw())
+            self.draw()
+
+        def toggle(self, _e=None):
+            self.var.set(not self.var.get())
+            if self.command:
+                self.command()
+            return "break"
+
+        def draw(self):
+            self.delete("all")
+            on, w, h = bool(self.var.get()), self.w, self.h
+            col = T["accent"] if on else T["off"]
+            self.create_oval(0, 0, h, h, fill=col, outline=col)
+            self.create_oval(w - h, 0, w, h, fill=col, outline=col)
+            self.create_rectangle(h / 2, 0, w - h / 2, h, fill=col, outline=col)
+            pad = max(2, int(3 * self.s))
+            x = w - h if on else 0
+            focused = self.focus_get() is self
+            self.create_oval(x + pad, pad, x + h - pad, h - pad, fill="white",
+                             outline=T["accent_hi"] if focused and not on else "",
+                             width=max(1, int(self.s)))
+
+    class Segmented(tk.Frame):
+        """A row of mutually exclusive choices (replaces radio buttons)."""
+
+        def __init__(self, parent, var, options, s, font, command=None):
+            super().__init__(parent, bg=T["line"], padx=1, pady=1, takefocus=1,
+                             highlightthickness=0)
+            self.var, self.values, self.command = var, [v for v, _ in options], command
+            self.enabled, self.items = True, {}
+            for i, (value, label) in enumerate(options):
+                lb = tk.Label(self, text=label, font=font, padx=int(12 * s), pady=int(4 * s),
+                              cursor="hand2")
+                lb.grid(row=0, column=i, padx=(1 if i else 0, 0))
+                lb.bind("<Button-1>", lambda e, v=value: self.pick(v))
+                self.items[value] = lb
+            self.bind("<Left>", lambda e: self.move(-1))
+            self.bind("<Right>", lambda e: self.move(+1))
+            self.bind("<FocusIn>", lambda e: self.config(bg=T["accent_hi"]))
+            self.bind("<FocusOut>", lambda e: self.config(bg=T["line"]))
+            var.trace_add("write", lambda *a: self.draw())
+            self.draw()
+
+        def pick(self, value):
+            if self.enabled:
+                self.var.set(value)
+                if self.command:
+                    self.command()
+
+        def move(self, d):
+            i = self.values.index(self.var.get()) if self.var.get() in self.values else 0
+            self.pick(self.values[max(0, min(len(self.values) - 1, i + d))])
+
+        def set_enabled(self, on):
+            self.enabled = on
+            self.draw()
+
+        def draw(self):
+            for value, lb in self.items.items():
+                sel = value == self.var.get()
+                if not self.enabled:
+                    lb.config(bg=T["line"] if sel else T["card"], fg=T["off_hi"], cursor="")
+                else:
+                    lb.config(bg=T["accent"] if sel else T["input"],
+                              fg="white" if sel else T["muted"], cursor="hand2")
+
+    class Stepper(tk.Frame):
+        """[ − ]  10 sec  [ + ]  for the time per photo."""
+
+        def __init__(self, parent, var, s, font):
+            super().__init__(parent, bg=T["card"])
+            self.var = var
+            self.values = sorted(set(INTERVALS) | {int(var.get())})
+            self.minus = flat_button(self, "−", lambda: self.move(-1), s, font)
+            self.label = tk.Label(self, font=font, fg=T["text"], bg=T["card"],
+                                  width=7, anchor="center")
+            self.plus = flat_button(self, "+", lambda: self.move(+1), s, font)
+            for b in (self.minus, self.plus):
+                b.config(padx=int(10 * s), pady=int(2 * s))
+            self.minus.pack(side="left")
+            self.label.pack(side="left")
+            self.plus.pack(side="left")
+            self.draw()
+
+        def move(self, d):
+            i = self.values.index(int(self.var.get())) + d
+            self.var.set(self.values[max(0, min(len(self.values) - 1, i))])
+            self.draw()
+
+        def draw(self):
+            v = int(self.var.get())
+            self.label.config(text=fmt_interval(v))
+            self.minus.config(state="disabled" if v <= self.values[0] else "normal")
+            self.plus.config(state="disabled" if v >= self.values[-1] else "normal")
+
     class SettingsDialog(tk.Toplevel):
         def __init__(self, app):
             super().__init__(app.root)
             self.app = app
             self.picker = None
+            self._scan_job = None
+            self._scan_token = 0
+            self._scan_result = None
             cfg = app.cfg
+            fam = ui_font_family()
+            s = self.s = ui_scale(fam)
+            self.f_title = tkfont.Font(family=fam, size=15, weight="bold")
+            self.f_body = tkfont.Font(family=fam, size=11)
+            self.f_small = tkfont.Font(family=fam, size=9)
+            self.f_section = tkfont.Font(family=fam, size=9, weight="bold")
+            px = self.px = lambda v: int(v * s)
+
             self.title(f"{APP} settings")
-            self.configure(padx=20, pady=16)
+            self.configure(bg=T["bg"], padx=px(24), pady=px(20))
             self.resizable(False, False)
             self.transient(app.root)
             self.attributes("-topmost", True)
@@ -541,7 +696,7 @@ if tk is not None:
             self.v_folder = tk.StringVar(value=cfg["folder"])
             self.v_recursive = tk.BooleanVar(value=cfg["recursive"])
             self.v_shuffle = tk.BooleanVar(value=cfg["shuffle"])
-            self.v_interval = tk.StringVar(value=str(cfg["interval"]))
+            self.v_interval = tk.IntVar(value=cfg["interval"])
             self.v_fit = tk.StringVar(value=cfg["fit"])
             self.v_bg = tk.StringVar(value=cfg["background"])
             self.v_fade = tk.BooleanVar(value=cfg["fade"])
@@ -549,88 +704,231 @@ if tk is not None:
             self.v_name = tk.BooleanVar(value=cfg["show_name"])
             self.v_awake = tk.BooleanVar(value=cfg["keep_awake"])
             self.v_autostart = tk.BooleanVar(value=os.path.exists(AUTOSTART_PATH))
-            self.v_error = tk.StringVar()
+            self.v_status = tk.StringVar()
+            # Last folder (+subfolder flag) confirmed to contain photos; only this
+            # is applied to the slideshow, so a half-typed path never blanks it.
+            self._good = (cfg["folder"], cfg["recursive"]) if app.photos else None
+            self._apply_job = None
 
-            r = 0
-            ttk.Label(self, text="Photo folder").grid(row=r, column=0, sticky="w")
-            ttk.Entry(self, textvariable=self.v_folder, width=42).grid(row=r, column=1, padx=6)
-            self.browse_btn = ttk.Button(self, text="Browse…", command=self.browse)
-            self.browse_btn.grid(row=r, column=2)
-            r += 1
-            ttk.Checkbutton(self, text="Include subfolders", variable=self.v_recursive)\
-                .grid(row=r, column=1, sticky="w", pady=(4, 0))
-            r += 1
-            ttk.Checkbutton(self, text="Shuffle photos", variable=self.v_shuffle)\
-                .grid(row=r, column=1, sticky="w")
-            r += 1
-            ttk.Separator(self).grid(row=r, column=0, columnspan=3, sticky="ew", pady=10)
-            r += 1
-            ttk.Label(self, text="Seconds per photo").grid(row=r, column=0, sticky="w")
-            ttk.Spinbox(self, from_=3, to=3600, textvariable=self.v_interval, width=8)\
-                .grid(row=r, column=1, sticky="w", padx=6)
-            r += 1
-            ttk.Label(self, text="Display").grid(row=r, column=0, sticky="w", pady=(6, 0))
-            f = ttk.Frame(self)
-            f.grid(row=r, column=1, sticky="w", padx=6, pady=(6, 0))
-            ttk.Radiobutton(f, text="Show whole photo", value="fit",
-                            variable=self.v_fit).pack(side="left")
-            ttk.Radiobutton(f, text="Fill screen (crop)", value="fill",
-                            variable=self.v_fit).pack(side="left", padx=10)
-            r += 1
-            ttk.Label(self, text="Background").grid(row=r, column=0, sticky="w")
-            f = ttk.Frame(self)
-            f.grid(row=r, column=1, sticky="w", padx=6)
-            ttk.Radiobutton(f, text="Blurred photo", value="blur",
-                            variable=self.v_bg).pack(side="left")
-            ttk.Radiobutton(f, text="Black", value="black",
-                            variable=self.v_bg).pack(side="left", padx=10)
-            r += 1
-            ttk.Checkbutton(self, text="Fade between photos", variable=self.v_fade)\
-                .grid(row=r, column=1, sticky="w", pady=(6, 0))
-            r += 1
-            ttk.Checkbutton(self, text="Show clock and date", variable=self.v_clock)\
-                .grid(row=r, column=1, sticky="w")
-            r += 1
-            ttk.Checkbutton(self, text="Show file name", variable=self.v_name)\
-                .grid(row=r, column=1, sticky="w")
-            r += 1
-            ttk.Separator(self).grid(row=r, column=0, columnspan=3, sticky="ew", pady=10)
-            r += 1
-            ttk.Checkbutton(self, text="Keep screen on while running "
-                                       f"(sleep allowed below {BATTERY_LOW_PERCENT}% battery)",
-                            variable=self.v_awake).grid(row=r, column=1, sticky="w")
-            r += 1
-            ttk.Checkbutton(self, text="Start automatically when I log in",
-                            variable=self.v_autostart).grid(row=r, column=1, sticky="w")
-            r += 1
-            ttk.Label(self, textvariable=self.v_error, foreground="#c0392b")\
-                .grid(row=r, column=0, columnspan=3, sticky="w", pady=(10, 0))
-            r += 1
-            ttk.Label(self, foreground="#666", justify="left", text=(
-                "While running:  S = settings   ←/→ = previous/next   "
-                "Space = pause   Esc = quit")).grid(row=r, column=0, columnspan=3,
-                                                    sticky="w", pady=(6, 0))
-            r += 1
-            b = ttk.Frame(self)
-            b.grid(row=r, column=0, columnspan=3, sticky="e", pady=(14, 0))
-            ttk.Button(b, text="Quit", command=app.quit).pack(side="right")
-            ttk.Button(b, text="Start slideshow", command=self.on_start)\
-                .pack(side="right", padx=8)
+            # Header
+            tk.Label(self, text="Settings", font=self.f_title, fg=T["text"], bg=T["bg"])\
+                .grid(row=0, column=0, columnspan=2, sticky="w")
+            tk.Label(self, text="Changes apply right away and are saved automatically.",
+                     font=self.f_small, fg=T["muted"], bg=T["bg"])\
+                .grid(row=1, column=0, columnspan=2, sticky="w")
+
+            left = tk.Frame(self, bg=T["bg"])
+            right = tk.Frame(self, bg=T["bg"])
+            left.grid(row=2, column=0, sticky="nsew", padx=(0, px(10)))
+            right.grid(row=2, column=1, sticky="nsew", padx=(px(10), 0))
+
+            # Photos
+            c = self._card(left, "Photos")
+            box = tk.Frame(c, bg=T["card"])
+            box.grid(row=0, column=0, columnspan=2, sticky="ew",
+                     padx=px(16), pady=(px(12), px(10)))
+            box.columnconfigure(0, weight=1)
+            tk.Label(box, text="Folder", font=self.f_body, fg=T["text"], bg=T["card"])\
+                .grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, px(6)))
+            self.entry = tk.Entry(box, textvariable=self.v_folder, font=self.f_body, width=30,
+                                  fg=T["text"], bg=T["input"], insertbackground=T["text"],
+                                  relief="flat", highlightthickness=1,
+                                  highlightbackground=T["line"], highlightcolor=T["accent"])
+            self.entry.grid(row=1, column=0, sticky="ew", ipady=px(4))
+            self.browse_btn = flat_button(box, "Browse…", self.browse, s, self.f_body)
+            self.browse_btn.grid(row=1, column=1, padx=(px(8), 0), sticky="ns")
+            self.status = tk.Label(box, textvariable=self.v_status, font=self.f_small,
+                                   fg=T["muted"], bg=T["card"], anchor="w", justify="left",
+                                   wraplength=px(330))
+            self.status.grid(row=2, column=0, columnspan=2, sticky="w", pady=(px(6), 0))
+            c.rows = 1
+            self._toggle_row(c, "Include subfolders", self.v_recursive,
+                             command=self._folder_changed)
+            self._toggle_row(c, "Shuffle", self.v_shuffle, hint="Show photos in random order")
+
+            # On screen
+            c = self._card(left, "On screen")
+            self._toggle_row(c, "Clock and date", self.v_clock)
+            self._toggle_row(c, "File name", self.v_name)
+
+            # Slideshow
+            c = self._card(right, "Slideshow")
+            self._row(c, "Time per photo", Stepper(c, self.v_interval, s, self.f_body))
+            self._row(c, "Photo size", Segmented(
+                c, self.v_fit, [("fit", "Whole photo"), ("fill", "Fill screen")], s,
+                self.f_body, command=self._fit_changed))
+            self.bg_seg = Segmented(c, self.v_bg, [("blur", "Blurred"), ("black", "Black")],
+                                    s, self.f_body)
+            self._row(c, "Background", self.bg_seg, hint="Around photos that don't fill the screen")
+            self._toggle_row(c, "Fade between photos", self.v_fade)
+
+            # Power
+            c = self._card(right, "Power")
+            self._toggle_row(c, "Keep screen on", self.v_awake,
+                             hint=f"Sleep is allowed again below {BATTERY_LOW_PERCENT}% battery")
+            self._toggle_row(c, "Start when I log in", self.v_autostart)
+
+            # Footer
+            foot = tk.Frame(self, bg=T["bg"])
+            foot.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(px(20), 0))
+            tk.Label(foot, font=self.f_small, fg=T["muted"], bg=T["bg"], justify="left",
+                     text="While running:  S settings  ·  ←/→ browse  ·  Space pause  ·  Esc quit")\
+                .pack(side="left")
+            self.start_btn = flat_button(foot, "Done", self.on_start, s,
+                                         self.f_body, primary=True)
+            self.start_btn.pack(side="right")
+            flat_button(foot, "Quit", app.quit, s, self.f_body).pack(side="right", padx=px(8))
+
             self.bind("<Return>", lambda e: self.on_start())
+            self.bind("<KP_Enter>", lambda e: self.on_start())
             self.bind("<Escape>", lambda e: self.on_close())
+            self.v_folder.trace_add("write", lambda *a: self._folder_changed())
+            for v in (self.v_shuffle, self.v_interval, self.v_fit, self.v_bg, self.v_fade,
+                      self.v_clock, self.v_name, self.v_awake, self.v_autostart):
+                v.trace_add("write", lambda *a: self._schedule_apply())
+            self._fit_changed()
+            self._folder_changed(delay=0)
 
             self.update_idletasks()
             x = (self.winfo_screenwidth() - self.winfo_reqwidth()) // 2
-            y = (self.winfo_screenheight() - self.winfo_reqheight()) // 3
+            y = max(0, (self.winfo_screenheight() - self.winfo_reqheight()) // 3)
             self.geometry(f"+{x}+{y}")
             self.lift()
             self.focus_force()
+            self.start_btn.focus_set()
             # No grab_set(): a grab on a window hidden behind the fullscreen
             # slideshow would make the whole app look frozen with no way out.
             self._keep_visible()
 
+        # ---- layout helpers
+        def _card(self, parent, title):
+            px = self.px
+            first = not parent.winfo_children()
+            tk.Label(parent, text=title.upper(), font=self.f_section, fg=T["muted"], bg=T["bg"])\
+                .pack(anchor="w", pady=(px(14) if first else px(18), px(6)))
+            c = tk.Frame(parent, bg=T["card"], highlightthickness=1,
+                         highlightbackground=T["line"], highlightcolor=T["line"])
+            c.pack(fill="x")
+            c.columnconfigure(0, weight=1)
+            c.rows = 0
+            return c
+
+        def _row(self, card, label, control, hint=None):
+            px = self.px
+            if card.rows:
+                tk.Frame(card, height=1, bg=T["line"]).grid(
+                    row=card.rows * 2 - 1, column=0, columnspan=2, sticky="ew", padx=px(16))
+            r = card.rows * 2
+            box = tk.Frame(card, bg=T["card"])
+            box.grid(row=r, column=0, sticky="w", padx=(px(16), px(12)), pady=px(9))
+            lab = tk.Label(box, text=label, font=self.f_body, fg=T["text"], bg=T["card"])
+            lab.pack(anchor="w")
+            parts = [box, lab]
+            if hint:
+                h = tk.Label(box, text=hint, font=self.f_small, fg=T["muted"], bg=T["card"])
+                h.pack(anchor="w")
+                parts.append(h)
+            control.grid(row=r, column=1, sticky="e", padx=(0, px(16)))
+            card.rows += 1
+            return parts
+
+        def _toggle_row(self, card, label, var, hint=None, command=None):
+            t = Toggle(card, var, self.s, command=command)
+            for w in self._row(card, label, t, hint):  # clicking the text toggles too
+                w.config(cursor="hand2")
+                w.bind("<Button-1>", t.toggle)
+            return t
+
+        def _fit_changed(self):
+            self.bg_seg.set_enabled(self.v_fit.get() == "fit")
+
+        # ---- live folder check (runs in a thread so big folders never freeze the UI)
+        def _set_status(self, text, kind="muted"):
+            self.v_status.set(text)
+            self.status.config(fg=T[kind])
+
+        def _folder_changed(self, delay=400):
+            if self._scan_job:
+                self.after_cancel(self._scan_job)
+            self._set_status("Checking folder…")
+            self._scan_job = self.after(delay, self._start_scan)
+
+        def _start_scan(self):
+            self._scan_job = None
+            folder = os.path.expanduser(self.v_folder.get().strip())
+            recursive = self.v_recursive.get()
+            self._scan_token += 1
+            token = self._scan_token
+
+            def work():
+                problem = folder_problem(folder)
+                n = 0 if problem else len(scan_folder(folder, recursive))
+                self._scan_result = (token, problem, n, folder, recursive)
+
+            threading.Thread(target=work, daemon=True).start()
+            self.after(100, self._poll_scan)
+
+        def _poll_scan(self):
+            try:
+                if not self.winfo_exists():
+                    return
+            except tk.TclError:
+                return
+            r = self._scan_result
+            if r is None or r[0] != self._scan_token:
+                self.after(100, self._poll_scan)
+                return
+            _, problem, n, folder, recursive = r
+            keep = "  ·  still showing the previous folder" if self._good else ""
+            if problem:
+                self._set_status(problem + keep, "error")
+            elif n == 0:
+                self._set_status("No photos in this folder (.jpg, .png, .webp…)" + keep, "error")
+            else:
+                more = "+" if n >= MAX_SCAN_FILES else ""
+                self._set_status(f"✓  {n:,}{more} photo{'s' if n != 1 else ''} found", "ok")
+                if self._good != (folder, recursive):
+                    self._good = (folder, recursive)
+                    self._schedule_apply()
+
+        # ---- live apply: every change shows on the slideshow behind right away
+        def _schedule_apply(self):
+            if self._apply_job:
+                self.after_cancel(self._apply_job)
+            self._apply_job = self.after(150, self._apply_live)
+
+        def _collect(self):
+            folder, recursive = self._good or (self.app.cfg["folder"], self.app.cfg["recursive"])
+            return validate_config(dict(
+                folder=folder, recursive=recursive, shuffle=self.v_shuffle.get(),
+                interval=self.v_interval.get(), fit=self.v_fit.get(),
+                background=self.v_bg.get(), fade=self.v_fade.get(),
+                show_clock=self.v_clock.get(), show_name=self.v_name.get(),
+                keep_awake=self.v_awake.get(),
+                rescan_minutes=self.app.cfg.get("rescan_minutes")))
+
+        def _apply_live(self):
+            if self._apply_job:
+                try:
+                    self.after_cancel(self._apply_job)
+                except tk.TclError:
+                    pass
+                self._apply_job = None
+            new = self._collect()
+            if new != self.app.cfg:
+                self.app.apply_settings(new)
+                save_config(new)
+            if self.v_autostart.get() != os.path.exists(AUTOSTART_PATH):
+                try:
+                    set_autostart(self.v_autostart.get())
+                except OSError as e:
+                    log.warning("autostart change failed: %s", e)
+
         def _keep_visible(self):
-            if not self.winfo_exists():
+            try:
+                if not self.winfo_exists():
+                    return
+            except tk.TclError:
                 return
             if self.picker is None:
                 self.lift()
@@ -659,7 +957,7 @@ if tk is not None:
                     self.v_folder.set(path)
                 return
             self.attributes("-topmost", False)
-            self.browse_btn.state(["disabled"])
+            self.browse_btn.config(state="disabled")
             self.picker_started = time.monotonic()
             self.after(200, self._poll_picker)
 
@@ -674,7 +972,7 @@ if tk is not None:
                 return
             out = self.picker.stdout.read().strip() if self.picker.returncode == 0 else ""
             self.picker = None
-            self.browse_btn.state(["!disabled"])
+            self.browse_btn.config(state="normal")
             self.attributes("-topmost", True)
             if out:
                 self.v_folder.set(out)
@@ -688,42 +986,37 @@ if tk is not None:
                     pass
                 self.picker = None
             try:
-                self.browse_btn.state(["!disabled"])
+                self.browse_btn.config(state="normal")
                 self.attributes("-topmost", True)
             except tk.TclError:
                 pass
 
         def on_close(self):
-            """Esc / window close: start if possible, otherwise never trap the user:
-            go back to the running slideshow (discarding changes), or quit."""
+            """Esc / window close: never trap the user. Close if the slideshow has
+            photos (keeping the last folder that worked), otherwise quit."""
             if self.on_start():
                 return
             if self.app.photos:
+                self._apply_live()
                 self.destroy()
                 self.app.settings_closed()
             else:
                 self.app.quit()
 
         def on_start(self):
+            """Done: the folder in the box must be valid, then close."""
             folder = os.path.expanduser(self.v_folder.get().strip())
-            problem = folder_problem(folder)
-            if not problem and not scan_folder(folder, self.v_recursive.get()):
-                problem = "No photos found in that folder. Pick one with .jpg / .png / .webp images."
-            if problem:
-                self.v_error.set(problem)
-                return False
-            self.app.cfg = validate_config(dict(
-                folder=folder, recursive=self.v_recursive.get(), shuffle=self.v_shuffle.get(),
-                interval=self.v_interval.get(), fit=self.v_fit.get(),
-                background=self.v_bg.get(), fade=self.v_fade.get(),
-                show_clock=self.v_clock.get(), show_name=self.v_name.get(),
-                keep_awake=self.v_awake.get(),
-                rescan_minutes=self.app.cfg.get("rescan_minutes")))
-            save_config(self.app.cfg)
-            try:
-                set_autostart(self.v_autostart.get())
-            except OSError as e:
-                log.warning("autostart change failed: %s", e)
+            recursive = self.v_recursive.get()
+            if self._good != (folder, recursive):
+                problem = folder_problem(folder)
+                if not problem and not scan_folder(folder, recursive):
+                    problem = "No photos in this folder (.jpg, .png, .webp…)"
+                if problem:
+                    self._set_status(problem, "error")
+                    self.entry.focus_set()
+                    return False
+                self._good = (folder, recursive)
+            self._apply_live()
             self._kill_picker()
             self.destroy()
             self.app.settings_closed()
@@ -747,13 +1040,22 @@ if tk is not None:
             self.canvas = tk.Canvas(self.root, bg="black", highlightthickness=0)
             self.canvas.pack(fill="both", expand=True)
             self.img_item = self.canvas.create_image(self.W // 2, self.H // 2, anchor="center")
-            self.clock_sh = self._text(self.W - 38, self.H - 38, "se", 40, shadow=True)
-            self.clock = self._text(self.W - 40, self.H - 40, "se", 40)
-            self.date_sh = self._text(self.W - 38, self.H - 98, "se", 16, shadow=True)
-            self.date = self._text(self.W - 40, self.H - 100, "se", 16)
-            self.name_sh = self._text(42, self.H - 38, "sw", 13, shadow=True)
-            self.name = self._text(40, self.H - 40, "sw", 13)
-            self.status = self._text(self.W // 2, 40, "n", 15)
+            # Fonts are measured so the date sits just above the clock at any
+            # screen resolution / display scaling (fixed offsets overlapped on HiDPI).
+            clock_font = tkfont.Font(family="Sans", size=40, weight="bold")
+            small_font = tkfont.Font(family="Sans", size=16)
+            name_font = tkfont.Font(family="Sans", size=13)
+            m = 40                                               # margin from screen edge
+            clock_y = self.H - m
+            date_y = clock_y - clock_font.metrics("linespace")  # bottom of date = top of clock
+            self.clock_sh = self._text(self.W - m + 2, clock_y + 2, "se", clock_font, shadow=True)
+            self.clock = self._text(self.W - m, clock_y, "se", clock_font)
+            self.date_sh = self._text(self.W - m + 2, date_y + 2, "se", small_font, shadow=True)
+            self.date = self._text(self.W - m, date_y, "se", small_font)
+            self.name_sh = self._text(m + 2, self.H - m + 2, "sw", name_font, shadow=True)
+            self.name = self._text(m, self.H - m, "sw", name_font)
+            self.status = self._text(self.W // 2, m, "n", tkfont.Font(family="Sans", size=15))
+            self.fonts = (clock_font, small_font, name_font)  # keep references alive
 
             self.keep_awake = KeepAwake()
             self.photos, self.order, self.pos = [], [], -1
@@ -788,10 +1090,9 @@ if tk is not None:
             self._heartbeat()
             self.root.after(200, self.boot)
 
-        def _text(self, x, y, anchor, size, shadow=False):
+        def _text(self, x, y, anchor, font, shadow=False):
             return self.canvas.create_text(x, y, anchor=anchor, text="",
-                                           fill="black" if shadow else "white",
-                                           font=("Sans", size, "bold" if size > 20 else "normal"))
+                                           fill="black" if shadow else "white", font=font)
 
         # ---- safety
         def _on_error(self, exc, val, tb):
@@ -884,13 +1185,56 @@ if tk is not None:
             self.settings = SettingsDialog(self)
 
         def settings_closed(self):
+            """Settings were already applied live; just resume the slideshow."""
             self.settings = None
             self.root.configure(cursor="none")
             self.root.focus_force()
-            self.frame = None  # re-render with new display options
-            self.history, self.hist_pos = [], -1
-            self.bad.clear()
-            self.start()
+            if self._current_path() is None:
+                self.start()
+            else:
+                self.keep_awake.set_wanted(self.cfg["keep_awake"])
+                self.paused = False
+                self._schedule_next()
+
+        def apply_settings(self, new):
+            """Apply changed settings immediately, redrawing only what's needed."""
+            old, self.cfg = self.cfg, new
+            self.keep_awake.set_wanted(new["keep_awake"])
+            if ((old["folder"], old["recursive"]) != (new["folder"], new["recursive"])
+                    or self._current_path() is None):
+                self.history, self.hist_pos = [], -1
+                self.bad.clear()
+                self.frame = None
+                self.rescan(reset=True)
+                self.step(+1, preview=True)  # show the new folder's first photo now
+                return
+            if old["shuffle"] != new["shuffle"]:
+                self._new_order()
+            if (old["fit"], old["background"]) != (new["fit"], new["background"]):
+                self._rerender_current()
+            if old["show_name"] != new["show_name"]:
+                self._update_name(self._current_path())
+            self._update_clock()
+
+        def _current_path(self):
+            if 0 <= self.hist_pos < len(self.history):
+                return self.history[self.hist_pos]
+            return None
+
+        def _rerender_current(self):
+            path = self._current_path()
+            if path is None:
+                return
+            try:
+                frame = render_photo(path, self.W, self.H, self.cfg["fit"], self.cfg["background"])
+            except Exception as e:
+                log.warning("re-render of %s failed: %s", path, e)
+                return
+            if self.fade_job:
+                self.root.after_cancel(self.fade_job)
+                self.fade_job = None
+            self.frame = frame
+            self._put(frame)
 
         # ---- playlist
         def rescan(self, reset=False):
@@ -921,8 +1265,10 @@ if tk is not None:
                 self._new_order(avoid=last)
             return None
 
-        def step(self, direction):
-            if self.settings is not None or self.closing:
+        def step(self, direction, preview=False):
+            # While settings are open the slideshow is paused; preview=True still
+            # draws a photo (used when the folder is changed from settings).
+            if self.closing or (self.settings is not None and not preview):
                 return
             self._cancel_next()
             for _ in range(20):  # skip unreadable files
@@ -999,9 +1345,7 @@ if tk is not None:
                 self.root.after_cancel(self.fade_job)
                 self.fade_job = None
             prev, self.frame = self.frame, frame
-            name = os.path.relpath(path, self.cfg["folder"]) if self.cfg["show_name"] else ""
-            self.canvas.itemconfigure(self.name, text=name)
-            self.canvas.itemconfigure(self.name_sh, text=name)
+            self._update_name(path)
             if self.cfg["fade"] and prev is not None and prev.size == frame.size:
                 self._fade(prev, frame, 1)
             else:
@@ -1024,15 +1368,25 @@ if tk is not None:
             self.tkimg = ImageTk.PhotoImage(img)
             self.canvas.itemconfigure(self.img_item, image=self.tkimg)
 
+        def _update_name(self, path):
+            name = ""
+            if path and self.cfg["show_name"]:
+                name = os.path.relpath(path, self.cfg["folder"])
+            self.canvas.itemconfigure(self.name, text=name)
+            self.canvas.itemconfigure(self.name_sh, text=name)
+
+        def _update_clock(self):
+            on = self.cfg["show_clock"]
+            t = time.strftime("%H:%M") if on else ""
+            d = time.strftime("%A, %d %B") if on else ""
+            for item, val in ((self.clock, t), (self.clock_sh, t),
+                              (self.date, d), (self.date_sh, d)):
+                if self.canvas.itemcget(item, "text") != val:
+                    self.canvas.itemconfigure(item, text=val)
+
         def _clock_tick(self):
             try:
-                on = self.cfg["show_clock"]
-                t = time.strftime("%H:%M") if on else ""
-                d = time.strftime("%A, %d %B") if on else ""
-                for item, val in ((self.clock, t), (self.clock_sh, t),
-                                  (self.date, d), (self.date_sh, d)):
-                    if self.canvas.itemcget(item, "text") != val:
-                        self.canvas.itemconfigure(item, text=val)
+                self._update_clock()
             finally:
                 if not self.closing:
                     self.root.after(1000, self._clock_tick)
